@@ -386,6 +386,7 @@ class AutomaticRefreshThread(threading.Thread):
                     time.sleep(timetosleep)
                     if not self.application.refresh_schedule_enabled:
                         self.application.logger.write("Auto-refresh disabled in preferences, cancelling %s refresh" % refresh_type)
+                        self.application.uninhibit_pm()
                         return
                     if self.application.app_hidden():
                         self.application.logger.write("Update Manager is in tray mode, performing %s refresh" % refresh_type)
@@ -426,10 +427,12 @@ class InstallThread(threading.Thread):
         Gdk.threads_enter()
         self.application.window.get_window().set_cursor(None)
         self.application.window.set_sensitive(True)
+        self.application.uninhibit_pm()
         Gdk.threads_leave()
 
     def run(self):
         self.application.cache_watcher.pause()
+        self.application.inhibit_pm("Installing updates")
         try:
             self.application.logger.write("Install requested by user")
             Gdk.threads_enter()
@@ -724,6 +727,7 @@ class RefreshThread(threading.Thread):
     def cleanup(self):
         # cleanup when finished refreshing
         self.application.refreshing = False
+        self.application.uninhibit_pm()
         if not self.running:
             return
         self.application.cache_watcher.resume()
@@ -762,6 +766,7 @@ class RefreshThread(threading.Thread):
 
         self.application.refreshing = True
         self.running = True
+        self.application.inhibit_pm("Refreshing available updates")
 
         if self.root_mode:
             while self.application.dpkg_locked():
@@ -1349,6 +1354,7 @@ class MintUpdate():
         self.updates_inhibited = False
         self.reboot_required = False
         self.refreshing = False
+        self.inhibit_cookie = 0
         self.logger = Logger()
         self.logger.write("Launching Update Manager")
         self.settings = Gio.Settings(schema_id="com.linuxmint.updates")
@@ -2620,6 +2626,99 @@ class MintUpdate():
     def restart_app(self):
         self.logger.write("Restarting update manager...")
         os.system("/usr/lib/linuxmint/mintUpdate/mintUpdate.py show &")
+
+    def inhibit_pm(self, reason):
+        # There is an overlap between the cleanup of an install thread and the
+        # post-install reload:
+        #
+        # install-inhibit -> InstallThread -> refresh-inhibit -> RefreshThread -> install-uninhibit -> refresh->uninhibit
+        # It ends up that the inhibitor gets released after the install thread, but before the refresh/reload finishes,
+        # which really isn't worth worrying about.
+        if self.inhibit_cookie > 0:
+            return
+
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        except GLib.Error as e:
+            self.logger.write("Couldn't get session bus to inhibit power management: %s" % e.message)
+            return
+
+        name, path, iface, args, unused = self.get_inhibitor_info(reason)
+
+        try:
+            ret = bus.call_sync(
+                name,
+                path,
+                iface,
+                "Inhibit",
+                args,
+                GLib.VariantType("(u)"),
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None
+            )
+        except GLib.Error as e:
+            self.logger.write("Could not inhibit power management: %s" % e.message)
+            return
+
+        self.logger.write("Inhibited power management")
+        self.inhibit_cookie = ret.unpack()[0]
+
+    def uninhibit_pm(self):
+        if self.inhibit_cookie > 0:
+            try:
+                bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+            except GLib.Error as e:
+                self.logger.write("Couldn't get session bus to uninhibit power management: %s" % e.message)
+                return
+
+            name, path, iface, unused_args, uninhibit_method = self.get_inhibitor_info("none")
+
+            try:
+                bus.call_sync(
+                    name,
+                    path,
+                    iface,
+                    uninhibit_method,
+                    GLib.Variant("(u)", (self.inhibit_cookie,)),
+                    None,
+                    Gio.DBusCallFlags.NONE,
+                    2000,
+                    None
+                )
+            except GLib.Error as e:
+                self.logger.write("Could not uninhibit power management: %s" % e.message)
+                return
+
+            self.logger.write("Resumed power management")
+            self.inhibit_cookie = 0
+
+    def get_inhibitor_info(self, reason):
+        session = os.environ.get("XDG_CURRENT_DESKTOP")
+
+        if session == "XFCE":
+            name = "org.freedesktop.PowerManagement"
+            path = "/org/freedesktop/PowerManagement/Inhibit"
+            iface = "org.freedesktop.PowerManagement.Inhibit"
+            args = GLib.Variant("(ss)", ("MintUpdate", reason))
+            uninhibit_method = "UnInhibit"
+        else:
+            # https://github.com/linuxmint/cinnamon-session/blob/master/cinnamon-session/csm-inhibitor.h#L51-L58
+            # LOGOUT | SUSPEND | IDLE
+            flags = 1 | 4 | 8
+
+            try:
+                xid = self.window.get_window().get_xid()
+            except:
+                xid = 0
+
+            name = "org.gnome.SessionManager"
+            path = "/org/gnome/SessionManager"
+            iface = "org.gnome.SessionManager"
+            args = GLib.Variant("(susu)", ("MintUpdate", xid, reason, flags))
+            uninhibit_method = "Uninhibit"
+
+        return name, path, iface, args, uninhibit_method
 
 ######### KERNEL FEATURES #########
 
